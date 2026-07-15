@@ -145,6 +145,20 @@ def audit_repo_state(repo_root: Path, commit: str) -> List[str]:
         warnings.append("not a git checkout: the published commit cannot be cross-checked here")
         return warnings
 
+    # An explicit pin outranks git HEAD by design (it is the escape hatch for deploys
+    # with no .git). But a pin that disagrees with the checkout it is running from is
+    # almost always a STALE pin — pm2 resolves the commit once at start and keeps
+    # handing back that value across restarts, so a `git pull` since then would have
+    # us advertising one commit while serving the code of another. Unverifiable, and
+    # silent unless someone says so.
+    head = _git(repo_root, "rev-parse", "HEAD")
+    if looks_like_commit(head) and str(head).lower() != commit.lower():
+        warnings.append(
+            f"published commit {commit[:10]} != checkout HEAD {str(head)[:10]}: the pin in "
+            f"POKER44_MODEL_REPO_COMMIT (or pm2's cached env) is stale. Clear it to publish "
+            f"HEAD, or re-pin it to the commit actually being served"
+        )
+
     dirty = _git(repo_root, "status", "--porcelain")
     if dirty:
         n = len([ln for ln in dirty.splitlines() if ln.strip()])
@@ -215,10 +229,6 @@ def build_manifest(
     """
     repo_root = Path(repo_root).resolve()
     commit = resolve_repo_commit(repo_root)
-    if commit:
-        # build_local_model_manifest() reads this straight from the environment, and
-        # would otherwise pick up the empty value that .env ships.
-        os.environ["POKER44_MODEL_REPO_COMMIT"] = commit
 
     present = [rel for rel in source_files if Path(repo_root, rel).is_file()]
     merged = dict(defaults)
@@ -228,11 +238,25 @@ def build_manifest(
     if artifact_hash:
         merged["artifact_sha256"] = artifact_hash
 
-    manifest = build_local_model_manifest(
-        repo_root=repo_root,
-        implementation_files=[Path(repo_root, rel) for rel in present],
-        defaults=merged,
-    )
+    # build_local_model_manifest() reads repo_commit straight from the environment and
+    # would otherwise pick up the empty value .env ships, ignoring our default. Feed it
+    # the resolved commit, then put the environment back exactly as we found it —
+    # publishing a manifest should not leave a pin behind for anything that reads the
+    # env after us (autopilot's trainer subprocess inherits this process's environ).
+    previous = os.environ.get("POKER44_MODEL_REPO_COMMIT")
+    if commit:
+        os.environ["POKER44_MODEL_REPO_COMMIT"] = commit
+    try:
+        manifest = build_local_model_manifest(
+            repo_root=repo_root,
+            implementation_files=[Path(repo_root, rel) for rel in present],
+            defaults=merged,
+        )
+    finally:
+        if previous is None:
+            os.environ.pop("POKER44_MODEL_REPO_COMMIT", None)
+        else:
+            os.environ["POKER44_MODEL_REPO_COMMIT"] = previous
 
     # Replace the absolute-path-dependent digest with one a third party can reproduce.
     manifest["implementation_sha256"] = implementation_digest(repo_root, present)
