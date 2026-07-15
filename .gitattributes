@@ -1,0 +1,23 @@
+# Git ATTRIBUTES — not ignore rules. (The previous revision of this file was a
+# verbatim copy of .gitignore's contents. Git parses this file as pattern+attribute
+# lines, so every one of those was a silent no-op — none of it ignored anything.
+# Ignore rules live in .gitignore.)
+
+# Normalise line endings so implementation_sha256 stays stable across platforms:
+# the manifest digest is computed over file CONTENT, so a CRLF checkout would hash
+# differently from the same commit and break third-party verification.
+* text=auto eol=lf
+
+*.py   text eol=lf diff=python
+*.js   text eol=lf
+*.json text eol=lf
+*.sh   text eol=lf
+*.md   text eol=lf
+
+# Binary: never diff or line-ending-munge these.
+*.pkl  binary
+*.npz  binary
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.pdf  binary

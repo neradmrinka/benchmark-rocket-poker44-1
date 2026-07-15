@@ -1,0 +1,13 @@
+# data + caches (public benchmark; refetch via README) and diagnostics
+data_cache/
+artifacts_backups/
+artifacts_v1_backup/
+_san_cache.npz
+_san_cache_meta.json
+*.log
+bakeoff_v2_results.txt
+live_diag.json
+live_payload_sample.json
+__pycache__/
+*.pyc
+autopilot_history.jsonl

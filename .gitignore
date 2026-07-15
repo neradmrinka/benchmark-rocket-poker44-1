@@ -1,0 +1,96 @@
+# rocket-r1 publishing policy — PUBLISH THE CODE, KEEP THE WEIGHTS AND DATA LOCAL.
+#
+# This file is the other half of the manifest we publish. The manifest claims
+# open_source: true and ships an implementation_sha256 over the files listed in
+# model/poker44_miner.py:SOURCE_FILES. That claim is only worth anything if those
+# files are actually in the repo at the published commit — so every one of them is
+# committed, and anyone can clone at repo_commit and recompute the digest.
+#
+# What stays private, and why it costs us nothing:
+#   * trained weights (model/artifacts/*.pkl) — attested by manifest.artifact_sha256,
+#     so the artifact is verifiable without being handed out. That is the edge: the
+#     recipe is public, the fitted model is not.
+#   * benchmark cache + live captures — data, not code; refetchable via autopilot.
+#   * prose (README/docs) — not published; the code is the description.
+#
+# Secrets (.env: wallet, hotkey, ports) never go near a commit.
+
+# --- secrets / operational config -------------------------------------------
+.env
+.env.*
+!.env.example
+
+# --- virtualenvs ------------------------------------------------------------
+miner_env
+miner_env/
+.venv/
+.venv312/
+venv/
+env/
+ENV/
+
+# --- trained weights: private, attested by manifest.artifact_sha256 ---------
+*.pkl
+*.joblib
+*.joblib.bak
+*.npz
+*.pt
+*.pth
+*.ckpt
+*.h5
+*.hdf5
+*.onnx
+*.pb
+*.safetensors
+*.bin
+*.model
+*.prefinal_bak
+model/artifacts/*
+!model/artifacts/meta.json
+model/artifacts_backups/
+model/artifacts_v1_backup/
+
+# --- data: benchmark cache, live captures, diagnostics (never leave the box) -
+model/data_cache/
+model/live_capture/
+model/external_data/
+model/*.log
+model/autopilot_history.jsonl
+model/bakeoff_v3_results.txt
+model/live_diag.json
+model/live_payload_sample.json
+_san_cache.npz
+_san_cache_meta.json
+catboost_info/
+wandb/
+hands_generator/human_hands/
+hands_generator/evaluation_datas/
+train_data/
+retrain_data/
+logs/
+*.log
+
+# --- prose: descriptions are not published; the code is the description ------
+README.md
+readme.md
+docs/
+*.md
+!model/artifacts/meta.json
+
+# --- python -----------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# --- IDE / OS ---------------------------------------------------------------
+.idea/
+.vscode/
+.DS_Store
