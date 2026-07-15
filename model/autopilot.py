@@ -14,8 +14,9 @@ whole loop:
   2. RETRAIN  refit on everything cached (train_rocket.py, which re-selects the
               blend weights by walk-forward as the pool grows).
   3. GUARD    keep the candidate ONLY if its walk-forward reward does not regress
-              and its human false-positive rate stays under the ceiling. Anything
-              else is reverted from a backup taken before training started.
+              against the model currently being served, and clears an absolute
+              sanity floor. Anything else is reverted from a backup taken before
+              training started.
   4. DEPLOY   restart the miner if — and only if — the artifact on disk changed,
               so what we serve always equals what the manifest attests.
 
@@ -63,7 +64,25 @@ PY = sys.executable  # the interpreter the miner itself runs under
 
 # --- promotion guards ------------------------------------------------------ #
 REWARD_EPSILON = 0.002   # tolerate noise; require new >= old - epsilon
-MAX_DEPLOY_FPR = 0.06    # hard ceiling, well under the reward()'s human-safety cliff
+
+# Absolute floor, checked on top of the no-regression rule.
+#
+# This replaces an inherited `MAX_DEPLOY_FPR = 0.06` ceiling on meta['cv_fpr'] that
+# could never fire. cv_fpr comes out of reward() -> _recall_at_fpr(max_fpr=0.05),
+# which only ever selects an operating point from indices where fpr <= 0.05 — so the
+# value it reports is <= 0.05 by construction and never reaches 0.06. (Checked over
+# 25k random, adversarial and deliberately inverted models: the maximum observed was
+# exactly 0.0500.) Its comment also cited a "reward() human-safety cliff" that no
+# longer exists — reward() now sets human_safety_penalty = 1.0 unconditionally, and
+# scoring is pure ranking. So the ceiling was guarding nothing, against nothing.
+#
+# The gap it left behind is real though: on the FIRST train there is no baseline
+# (old_reward = -1.0), so the no-regression rule passes anything, including a
+# degenerate model. This floor is what catches that. A coin-flip model scores about
+# 0.75*base_rate + a little, i.e. ~0.25-0.35; a working one lands near 0.85. 0.50 sits
+# in the empty space between, so it rejects garbage without ever threatening a real
+# model.
+MIN_DEPLOY_REWARD = float(os.environ.get("POKER44_MIN_DEPLOY_REWARD", "0.50"))
 MINER_PM2_NAME = model_identity.env("POKER44_PM2_NAME", "poker44_miner")
 
 
@@ -124,7 +143,11 @@ def refresh_data() -> int:
 # --------------------------------------------------------------------------- #
 # 2 + 3. RETRAIN under guard
 # --------------------------------------------------------------------------- #
-def read_meta(art_dir: Path = ART) -> dict | None:
+def read_meta(art_dir: Path | None = None) -> dict | None:
+    # Resolved at call time, not bound as a default: a default argument would capture
+    # ART once at import and keep reading the original directory even after ART is
+    # repointed, which silently reports the wrong baseline reward.
+    art_dir = Path(art_dir) if art_dir is not None else ART
     try:
         with (art_dir / "meta.json").open() as fh:
             return json.load(fh)
@@ -188,8 +211,9 @@ def retrain_and_guard(force_deploy: bool) -> bool:
         f"| weights={new_meta.get('weights')}")
 
     reasons = []
-    if new_fpr >= MAX_DEPLOY_FPR:
-        reasons.append(f"fpr {new_fpr:.4f} >= ceiling {MAX_DEPLOY_FPR}")
+    if new_reward < MIN_DEPLOY_REWARD:
+        reasons.append(f"reward {new_reward:.4f} < absolute floor {MIN_DEPLOY_REWARD} "
+                       f"(model looks degenerate)")
     if not force_deploy and new_reward < old_reward - REWARD_EPSILON:
         reasons.append(f"reward {new_reward:.4f} < baseline {old_reward:.4f} - eps")
 
