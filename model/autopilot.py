@@ -22,7 +22,9 @@ whole loop:
 
 Crash-safe and idempotent: the previous artifact is backed up before training and
 restored on any regression, guard failure, or exception, so the miner is never left
-serving a worse or broken model.
+serving a worse or broken model. A run killed outright (OOM, reboot) inside the guard
+window leaves a marker file behind; the next run sees it and undoes the unapproved
+candidate before doing anything else.
 
 Also reports live-vs-training feature drift (live_probe.py). A benchmark CV number
 says nothing about the live feed once the distributions separate, and this is the
@@ -50,6 +52,10 @@ BACKUPS = HERE / "artifacts_backups"
 LOG = HERE / "autopilot.log"
 HISTORY = HERE / "autopilot_history.jsonl"
 TRAINER = HERE / "train_rocket.py"
+# Written while the guard window is open (trainer has overwritten artifacts/, no
+# decision taken yet). Its presence on startup means the last run was killed in that
+# window and left an unapproved candidate behind. Holds the backup path to undo it.
+MARKER = HERE / ".retrain_in_progress"
 
 for _p in (str(HERE), str(REPO)):
     if _p not in sys.path:
@@ -172,18 +178,89 @@ def restore(backup_dir: Path) -> None:
     shutil.copytree(backup_dir, ART)
 
 
+def discard_candidate() -> None:
+    """Remove an artifact that failed the guard when there is nothing to revert to.
+
+    Serving nothing is the better failure: a degenerate model earns ~0 anyway, and it
+    would do so while publishing a manifest that attests to its own bad numbers. The
+    miner then refuses to start with a clear 'no trained model' error, which points at
+    the real problem instead of hiding it behind a running process.
+    """
+    shutil.rmtree(ART, ignore_errors=True)
+    ART.mkdir(parents=True, exist_ok=True)
+
+
+def _recover_interrupted_run() -> None:
+    """Undo a previous run that died between training and its promotion decision.
+
+    The guard window opens the moment the trainer overwrites artifacts/ and closes
+    only after the decision — and it sits directly after a long, memory-hungry
+    training run, which is exactly when an OOM kill lands. A process killed in that
+    window leaves the UNGUARDED candidate on disk, and the next run would read its
+    meta.json as the baseline, quietly promoting a model nothing ever approved.
+    """
+    if not MARKER.is_file():
+        return
+    try:
+        backup = Path(MARKER.read_text(encoding="utf-8").strip())
+    except OSError:
+        MARKER.unlink(missing_ok=True)
+        return
+    if backup.is_dir():
+        restore(backup)
+        log(f"RECOVER: a previous run died mid-guard; restored the artifact from {backup.name}")
+    else:
+        discard_candidate()
+        log("RECOVER: a previous run died mid-guard with no backup to restore; "
+            "discarded the unguarded candidate")
+    MARKER.unlink(missing_ok=True)
+
+
 def retrain_and_guard(force_deploy: bool) -> bool:
     """Retrain, then keep the candidate only if it earns its place.
 
     Returns True when the artifact on disk changed (i.e. the miner must restart).
+    Any failure below — a crash, a malformed meta.json, a guard rejection — leaves the
+    previously served artifact in place.
     """
+    _recover_interrupted_run()
+
     old_meta = read_meta()
-    old_reward = float(old_meta["cv_reward"]) if old_meta else -1.0
+    old_reward = _meta_reward(old_meta) if old_meta else -1.0
     old_dates = int(old_meta.get("n_dates", 0)) if old_meta else 0
+    if old_meta and old_reward is None:
+        log("RETRAIN: the artifact on disk has no usable cv_reward; treating it as no baseline")
+        old_reward = -1.0
     backup = backup_current()
     log(f"RETRAIN: baseline cv_reward={old_reward:.4f} over {old_dates} dates"
         f"{' (backed up)' if backup else ' (no prior model)'}")
 
+    MARKER.parent.mkdir(parents=True, exist_ok=True)
+    MARKER.write_text(str(backup) if backup else "", encoding="utf-8")
+    try:
+        return _train_and_decide(force_deploy, backup, old_reward, old_dates)
+    except Exception as exc:  # never leave an unguarded candidate on disk
+        log(f"RETRAIN: unexpected failure during the guard ({type(exc).__name__}: {exc})")
+        if backup:
+            restore(backup)
+            log("RETRAIN: reverted to previous artifact")
+        else:
+            discard_candidate()
+            log("RETRAIN: discarded the candidate (no backup to revert to)")
+        return False
+    finally:
+        MARKER.unlink(missing_ok=True)
+
+
+def _meta_reward(meta) -> float | None:
+    try:
+        return float(meta["cv_reward"])
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def _train_and_decide(force_deploy: bool, backup: Path | None,
+                      old_reward: float, old_dates: int) -> bool:
     proc = subprocess.run(
         [PY, str(TRAINER)], cwd=str(HERE), capture_output=True, text=True,
         env={**os.environ, "POKER44_REPO": str(REPO), "PYTHONUNBUFFERED": "1"},
@@ -223,10 +300,19 @@ def retrain_and_guard(force_deploy: bool) -> bool:
             restore(backup)
             record_history("rejected", old_reward, new_reward, new_fpr, new_dates, reasons)
             return False
-        # First ever train and it already trips a guard: nothing to revert to, so keep
-        # it (a serving miner beats no miner) but make the noise impossible to miss.
-        log("RETRAIN: WARNING first model violates a guard but there is no backup to "
-            "revert to: " + "; ".join(reasons))
+        # No backup — a first train that already trips a guard. Discard it rather than
+        # ship it. dragon-0 kept this candidate on the theory that a serving miner
+        # beats no miner, which was harmless only because its fpr ceiling could never
+        # fire. Against a floor that CAN fire, the theory is wrong: a degenerate model
+        # earns ~0 either way, and serving it publishes a manifest attesting to its own
+        # bad numbers. Failing loudly makes someone look at why the first train produced
+        # garbage.
+        log("RETRAIN: REJECTED (" + "; ".join(reasons) + ") and there is no backup to "
+            "revert to -> discarding. The miner will not start until a model passes the "
+            "guard; check the benchmark cache and the trainer output above.")
+        discard_candidate()
+        record_history("rejected_no_backup", old_reward, new_reward, new_fpr, new_dates, reasons)
+        return False
 
     improved = new_reward > old_reward + REWARD_EPSILON
     fresher = new_dates > old_dates and new_reward >= old_reward - REWARD_EPSILON

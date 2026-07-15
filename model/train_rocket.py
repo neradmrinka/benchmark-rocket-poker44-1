@@ -202,6 +202,11 @@ def select_weights(oof_parts, y_oof):
     Every candidate is scored on the SAME held-out component predictions, so this
     compares blends rather than reruns training. The prior (grid[0]) keeps its seat
     unless a rival clears it by W_SELECT_MARGIN.
+
+    Returns (weights, reward, prior_reward). The winner's reward is a max over the
+    grid on this pool and is therefore optimistically biased; prior_reward is the
+    prior's score on the same pool with no selection applied to it, which is the more
+    conservative number. Both are recorded in meta.json.
     """
     prior = variant.W_GRID[0]
     scored = []
@@ -219,10 +224,10 @@ def select_weights(oof_parts, y_oof):
     if best is not prior and best_reward > prior_reward + variant.W_SELECT_MARGIN:
         print(f"  weights: prior {prior_reward:.4f} -> selected {best_reward:.4f} "
               f"(+{best_reward - prior_reward:.4f} > margin {variant.W_SELECT_MARGIN})", flush=True)
-        return dict(best), best_reward
+        return dict(best), best_reward, prior_reward
     print(f"  weights: keeping prior ({prior_reward:.4f}); best rival {best_reward:.4f} "
           f"did not clear the {variant.W_SELECT_MARGIN} margin", flush=True)
-    return dict(prior), prior_reward
+    return dict(prior), prior_reward, prior_reward
 
 
 def main() -> None:
@@ -244,23 +249,35 @@ def main() -> None:
     V2, cols_v2 = mat(chunks, v2_dict)
     UN = np.hstack([V2, PH])
 
-    signs = mine_monotone_signs(PH, y, dates, unique_dates)
     print(f"rocket-{variant.SLUG} | {len(y)} chunks | ph{PH.shape[1]} v2{V2.shape[1]} "
-          f"un{UN.shape[1]} | {sum(1 for s in signs if s)} monotone | "
-          f"{len(unique_dates)} dates ({time.time() - t0:.0f}s)", flush=True)
+          f"un{UN.shape[1]} | {len(unique_dates)} dates ({time.time() - t0:.0f}s)",
+          flush=True)
 
     # --- walk-forward: train on the past, predict the next unseen date ------ #
+    #
+    # The monotone signs are re-mined inside every fold from that fold's PAST dates
+    # only. dragon-0 mined them once over the whole dataset and reused them in each
+    # fold, which quietly leaked: the held-out date's labels helped decide the
+    # constraints baked into the `mono` component that was then scored on that very
+    # date. It inflates cv_reward — and cv_reward is not decoration here. It gates
+    # promotion in autopilot.py, it selects the blend weights below, and it is
+    # published in the manifest as a performance claim. A number carrying leakage
+    # would make all three dishonest.
     oof_parts = {name: np.full(len(y), np.nan) for name in PARTS}
     for test_date in unique_dates[-WF:]:
         train_rows = dates < test_date
         test_rows = dates == test_date
         if train_rows.sum() < 60 or len(set(y[train_rows])) < 2:
             continue
-        models = fit_components(PH, V2, UN, y, signs, train_rows)
+        past_dates = [d for d in unique_dates if d < test_date]
+        fold_signs = mine_monotone_signs(PH[train_rows], y[train_rows],
+                                         dates[train_rows], past_dates)
+        models = fit_components(PH, V2, UN, y, fold_signs, train_rows)
         preds = predict_components(models, PH, V2, UN, test_rows)
         for name in PARTS:
             oof_parts[name][test_rows] = preds[name]
-        print(f"  wf {test_date} ({time.time() - t0:.0f}s)", flush=True)
+        print(f"  wf {test_date} | {sum(1 for s in fold_signs if s)} monotone "
+              f"(mined on {len(past_dates)} past dates) ({time.time() - t0:.0f}s)", flush=True)
 
     covered = ~np.isnan(oof_parts["stack"])
     if covered.sum() < 20 or len(set(y[covered])) < 2:
@@ -268,7 +285,7 @@ def main() -> None:
     pooled = {name: oof_parts[name][covered] for name in PARTS}
     y_oof = y[covered]
 
-    weights, _ = select_weights(pooled, y_oof)
+    weights, _, prior_reward = select_weights(pooled, y_oof)
     oof_scores = blend(pooled, weights)
     cv_ap = float(average_precision_score(y_oof, oof_scores))
     cv_reward, res = reward(oof_scores, y_oof)
@@ -279,7 +296,12 @@ def main() -> None:
     deploy_threshold = fpr_target_threshold(oof_scores[y_oof == 0], TARGET_FPR)
 
     # --- final fit on everything ------------------------------------------- #
+    # The served model may use every date, including the walk-forward ones: nothing is
+    # measured on it. Only the cv_* numbers above have to be leak-free.
     all_rows = np.ones(len(y), dtype=bool)
+    signs = mine_monotone_signs(PH, y, dates, unique_dates)
+    print(f"final fit | {sum(1 for s in signs if s)} monotone constraints "
+          f"over all {len(unique_dates)} dates ({time.time() - t0:.0f}s)", flush=True)
     models = fit_components(PH, V2, UN, y, signs, all_rows)
     ens = RocketEnsemble(models["stack"], models["mono"], models["mlp"], models["drse"],
                          cols_ph, cols_v2, weights=weights)
@@ -298,6 +320,19 @@ def main() -> None:
         "weights": weights,
         "weights_prior": variant.W_PRIOR,
         "weights_selected_by": f"walk-forward over {WF} held-out date(s), margin {variant.W_SELECT_MARGIN}",
+        "weights_candidates": len(variant.W_GRID),
+        # Say plainly what cv_reward is, because the manifest publishes it as a claim:
+        # the weights were CHOSEN on this same walk-forward pool, so the number is a max
+        # over the candidate grid and is optimistically biased. cv_reward_prior is the
+        # untouched prior's score on the same pool — no selection happened against it, so
+        # it is the more conservative read. The two are equal whenever the prior held.
+        "cv_reward_prior": float(prior_reward),
+        "cv_reward_note": (
+            f"max over {len(variant.W_GRID)} candidate weightings evaluated on this same "
+            f"walk-forward pool; optimistically biased by that selection. Monotone "
+            f"constraints are re-mined per fold from past dates only (no label leakage). "
+            f"cv_reward_prior is the unselected prior's score on the same pool."
+        ),
         "deploy_threshold": float(deploy_threshold),
         "target_fpr": TARGET_FPR,
         "cv_ap": cv_ap,

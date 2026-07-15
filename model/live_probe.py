@@ -36,6 +36,15 @@ LOG_PATH = CAPTURE_DIR / "live_v2.jsonl"
 PROBE_RATE = max(1, int(os.environ.get("POKER44_PROBE_RATE", "20")))
 MAX_RECORDS = max(50, int(os.environ.get("POKER44_PROBE_MAX_RECORDS", "2000")))
 
+# Trim only once the file is meaningfully over budget, and decide that from a stat()
+# rather than by reading it. Checking the line count meant read_text()ing the whole log
+# on every sampled batch, and once it sat at the cap that turned into a multi-megabyte
+# read-and-rewrite inside every 20th scored response — synchronous latency on a reply
+# the validator is timing. Now: one stat() per sampled batch, and a rewrite roughly
+# once per (HIGH_WATER - MAX_RECORDS) records, amortised to nothing.
+_BYTES_PER_RECORD = 4096          # generous upper bound for ~250 rounded floats
+HIGH_WATER_BYTES = int(MAX_RECORDS * 1.25) * _BYTES_PER_RECORD
+
 _counter = 0
 
 
@@ -66,9 +75,13 @@ def record_batch(v2_matrix, *, n_chunks: int) -> None:
 
 
 def _trim() -> None:
-    """Keep the log bounded; it runs forever on a miner box."""
+    """Keep the log bounded; it runs forever on a miner box.
+
+    The stat() guard is the point: without it this reads and rewrites the entire log
+    on every sampled batch once the cap is reached.
+    """
     try:
-        if not LOG_PATH.exists():
+        if LOG_PATH.stat().st_size <= HIGH_WATER_BYTES:
             return
         lines = LOG_PATH.read_text(encoding="utf-8").splitlines()
         if len(lines) <= MAX_RECORDS:
@@ -76,7 +89,7 @@ def _trim() -> None:
         tmp = LOG_PATH.with_suffix(".tmp")
         tmp.write_text("\n".join(lines[-MAX_RECORDS:]) + "\n", encoding="utf-8")
         tmp.replace(LOG_PATH)
-    except Exception:
+    except OSError:
         return
 
 
