@@ -149,6 +149,29 @@ def refresh_data() -> int:
 # --------------------------------------------------------------------------- #
 # 2 + 3. RETRAIN under guard
 # --------------------------------------------------------------------------- #
+def model_is_current(added: int) -> bool:
+    """True when the served model already covers every benchmark date we have cached.
+
+    pm2 starts a cron app immediately as well as on its schedule, so without this every
+    `pm2 start`/`pm2 restart` kicks off a full retrain — four of them at once, saturating
+    the box for a quarter of an hour while the miners are trying to answer validators
+    inside a 20s timeout. And the guard would bin the result anyway: same data in, same
+    reward out, so the candidate is neither better nor fresher and gets reverted. Pure
+    cost at exactly the wrong moment.
+
+    A retrain still happens the moment REFRESH pulls a date we do not have, which is the
+    only time it can actually teach the model anything.
+    """
+    if added > 0:
+        return False
+    meta = read_meta()
+    if not meta or not (ART / "model.pkl").is_file():
+        return False
+    cached = {p.stem for p in DATA.glob("*.json")}
+    trained = set(meta.get("benchmark_releases", []))
+    return bool(cached) and cached.issubset(trained)
+
+
 def read_meta(art_dir: Path | None = None) -> dict | None:
     # Resolved at call time, not bound as a default: a default argument would capture
     # ART once at import and keep reading the original directory even after ART is
@@ -173,7 +196,37 @@ def backup_current() -> Path | None:
     return dest
 
 
+def is_backup(path: Path | None) -> bool:
+    """A real snapshot: under BACKUPS, and holding the weights we would restore."""
+    if path is None:
+        return False
+    path = Path(path)
+    if not str(path).strip() or not path.is_dir():
+        return False
+    try:
+        under_backups = path.resolve().parent == BACKUPS.resolve()
+    except OSError:
+        return False
+    return under_backups and (path / "model.pkl").is_file()
+
+
 def restore(backup_dir: Path) -> None:
+    """Swap the artifact directory back to a snapshot.
+
+    The validation is not paranoia. This function does `rmtree(ART)` first, so being
+    handed a path that is not a backup destroys the served model and copies something
+    arbitrary in its place. That is not hypothetical: an empty marker file read as
+    `Path("")` becomes `Path(".")`, which IS a directory, so an earlier revision of
+    _recover_interrupted_run() cheerfully restored the autopilot's own working
+    directory over artifacts/ — deleting four trained models and copying the whole
+    model tree (data_cache included) into their place. Refuse anything that is not a
+    snapshot we made.
+    """
+    if not is_backup(backup_dir):
+        raise ValueError(
+            f"refusing to restore from {str(backup_dir)!r}: not a backup under {BACKUPS} "
+            f"containing model.pkl"
+        )
     shutil.rmtree(ART, ignore_errors=True)
     shutil.copytree(backup_dir, ART)
 
@@ -202,18 +255,31 @@ def _recover_interrupted_run() -> None:
     if not MARKER.is_file():
         return
     try:
-        backup = Path(MARKER.read_text(encoding="utf-8").strip())
+        raw = MARKER.read_text(encoding="utf-8").strip()
     except OSError:
-        MARKER.unlink(missing_ok=True)
-        return
-    if backup.is_dir():
-        restore(backup)
-        log(f"RECOVER: a previous run died mid-guard; restored the artifact from {backup.name}")
-    else:
-        discard_candidate()
-        log("RECOVER: a previous run died mid-guard with no backup to restore; "
-            "discarded the unguarded candidate")
+        raw = ""
+    # Clear it first: whatever happens below, this run owns the recovery. A marker left
+    # in place would make every future run repeat it.
     MARKER.unlink(missing_ok=True)
+
+    if is_backup(Path(raw)) if raw else False:
+        restore(Path(raw))
+        log(f"RECOVER: a previous run died mid-guard; restored the artifact from {Path(raw).name}")
+        return
+
+    if not raw:
+        # The interrupted run had no backup to take (a first train). There is nothing to
+        # restore TO, so the only safe move is to drop whatever it left behind — that
+        # candidate never passed the guard.
+        #
+        # This empty case is what broke before: `Path("")` is `Path(".")`, `.is_dir()`
+        # is True, and restore() was handed the autopilot's own cwd.
+        log("RECOVER: a previous run died mid-guard before any model was approved; "
+            "discarding the unguarded candidate (there was no backup to restore)")
+    else:
+        log(f"RECOVER: marker names {raw!r}, which is not a usable backup; "
+            f"discarding the unguarded candidate")
+    discard_candidate()
 
 
 def retrain_and_guard(force_deploy: bool) -> bool:
@@ -401,6 +467,8 @@ def main() -> None:
                     help="promote even if reward ties/regresses (still honours the fpr ceiling)")
     ap.add_argument("--no-refresh", action="store_true", help="skip the data download")
     ap.add_argument("--dry-run", action="store_true", help="report state and drift; change nothing")
+    ap.add_argument("--force-train", action="store_true",
+                    help="retrain even when the model already covers every cached date")
     args = ap.parse_args()
 
     t0 = time.time()
@@ -417,6 +485,14 @@ def main() -> None:
         return
 
     added = 0 if args.no_refresh else refresh_data()
+    if not args.force_train and model_is_current(added):
+        meta = read_meta() or {}
+        log(f"SKIP: no new benchmark dates and the served model already covers all "
+            f"{meta.get('n_dates', '?')} cached date(s) "
+            f"(cv_reward={meta.get('cv_reward', 0):.4f}); nothing to retrain")
+        log(f"=== AUTOPILOT DONE in {time.time() - t0:.0f}s | new_dates=0 skipped=1 ===")
+        return
+
     changed = retrain_and_guard(force_deploy=args.force_deploy)
     if changed and not args.no_restart:
         restart_miner()

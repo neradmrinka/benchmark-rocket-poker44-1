@@ -124,12 +124,26 @@ module.exports = {
     },
     {
       // Nightly: refresh the benchmark, retrain under guard, restart on promotion.
-      // 00:16 UTC — a few minutes after the daily benchmark drop.
+      // Staggered 20min apart across the four miners (r1 00:16, r2 00:36, r3 00:56,
+      // r4 01:16 UTC) so they do not all retrain at once and starve each other --
+      // and the serving miners -- of CPU. All are after the daily benchmark drop.
       name: `${PM2_NAME}_autopilot`,
       script: path.join(MODEL, "autopilot.py"),
       interpreter: PY,
       cwd: MODEL,
-      env: SHARED,
+      // Cap the maths libraries. Left alone, every component spawns one BLAS/OpenMP
+      // thread per core, and four concurrent retrains put ~90 threads on 6 cores --
+      // the miners still have to answer validators inside a 20s timeout while that
+      // runs. The training data is small (2030 x 293), so BLAS parallelism buys
+      // nothing here and costs cache thrash.
+      env: {
+        ...SHARED,
+        OMP_NUM_THREADS: "1",
+        OPENBLAS_NUM_THREADS: "1",
+        MKL_NUM_THREADS: "1",
+        NUMEXPR_NUM_THREADS: "1",
+        POKER44_TRAIN_JOBS: SHARED.POKER44_TRAIN_JOBS || "2",
+      },
       autorestart: false,
       cron_restart: "16 0 * * *",
     },
