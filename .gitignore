@@ -29,7 +29,17 @@ venv/
 env/
 ENV/
 
-# --- trained weights: private, attested by manifest.artifact_sha256 ---------
+# --- trained artifacts: private; attested by manifest.artifact_sha256 -------
+#
+# model/artifacts/ is ignored WHOLE, meta.json included. An earlier revision
+# un-ignored meta.json to publish it as a model card, which was wrong: autopilot
+# rewrites it on every retrain that promotes, so a committed copy goes stale within a
+# day and then contradicts the live manifest -- a card that misdescribes the running
+# model is worse than no card, which is why d0's inherited one was dropped. The
+# manifest IS the card: it carries model name/version/framework, repo+commit,
+# implementation_sha256, artifact_sha256, the training-data statement and the
+# attestations, and it is delivered to a validator on every single query.
+# --------------------------------------------------------------------------
 *.pkl
 *.joblib
 *.joblib.bak
@@ -45,8 +55,7 @@ ENV/
 *.bin
 *.model
 *.prefinal_bak
-model/artifacts/*
-!model/artifacts/meta.json
+model/artifacts/
 model/artifacts_backups/
 model/artifacts_v1_backup/
 
@@ -76,7 +85,6 @@ README.md
 readme.md
 docs/
 *.md
-!model/artifacts/meta.json
 
 # --- python -----------------------------------------------------------------
 __pycache__/
